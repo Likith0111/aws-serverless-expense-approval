@@ -1,0 +1,375 @@
+openapi: 3.0.3
+
+info:
+  title: Expense Approval Workflow API
+  description: |
+    Serverless Intelligent Expense Approval Workflow API.
+
+    This API processes employee expense claims through an automated approval
+    workflow that validates expenses, checks corporate policies, detects
+    potential fraud using rule-based heuristics, and makes approval decisions.
+
+    Workflow Steps:
+      1. Validate expense claim structure and values
+      2. Check against corporate spending policies (parallel)
+      3. Apply fraud detection heuristics (parallel)
+      4. Make final approval decision (APPROVED, REJECTED, NEEDS_MANUAL_REVIEW)
+
+    Decisions are persisted to DynamoDB and retrievable via the GET endpoint.
+  version: 1.0.0
+  contact:
+    name: Expense Approval Team
+
+servers:
+  - url: http://localhost:5050
+    description: Local development server
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/prod
+    description: AWS API Gateway (deployed)
+    variables:
+      apiId:
+        default: "your-api-id"
+      region:
+        default: "us-east-1"
+
+tags:
+  - name: Expenses
+    description: Expense claim submission and retrieval
+  - name: Health
+    description: Service health check
+
+paths:
+  /:
+    get:
+      summary: Health check
+      operationId: healthCheck
+      tags:
+        - Health
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service:
+                    type: string
+                    example: "expense-approval-workflow"
+                  status:
+                    type: string
+                    example: "healthy"
+                  mode:
+                    type: string
+                    example: "local-development"
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /expense:
+    post:
+      summary: Submit an expense claim
+      description: |
+        Submit a new expense claim for automated processing. The claim flows
+        through validation, policy checking, fraud analysis, and decision
+        rendering. The response includes the generated expense ID and
+        current processing status.
+      operationId: submitExpense
+      tags:
+        - Expenses
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExpenseClaimRequest"
+            examples:
+              standard_meal:
+                summary: Standard meal expense (will be APPROVED)
+                value:
+                  employeeId: "EMP-001"
+                  amount: 45.00
+                  category: "meals"
+                  description: "Team lunch at downtown restaurant"
+                  receiptProvided: true
+              travel_expense:
+                summary: Travel expense (will be APPROVED)
+                value:
+                  employeeId: "EMP-002"
+                  amount: 350.00
+                  category: "travel"
+                  description: "Flight to NYC for client meeting"
+                  receiptProvided: true
+              suspicious_expense:
+                summary: Suspicious expense (will need MANUAL REVIEW)
+                value:
+                  employeeId: "EMP-003"
+                  amount: 24.99
+                  category: "miscellaneous"
+                  description: "test expense"
+                  receiptProvided: false
+              over_limit:
+                summary: Over-limit expense (will be REJECTED)
+                value:
+                  employeeId: "EMP-004"
+                  amount: 5000.00
+                  category: "meals"
+                  description: "Executive dinner at luxury venue"
+                  receiptProvided: true
+      responses:
+        "202":
+          description: Expense claim accepted and processing started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExpenseSubmissionResponse"
+              example:
+                message: "Expense claim submitted and processed successfully"
+                expenseId: "EXP-1A2B3C4D5E6F"
+                submittedAt: "2026-02-08T10:30:00+00:00"
+                status: "APPROVED"
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "Missing required fields: category, description"
+        "422":
+          description: Validation error (Pydantic)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /expense/{expenseId}:
+    get:
+      summary: Get expense decision
+      description: |
+        Retrieve the full expense record including validation results,
+        policy check outcome, fraud analysis, and the final approval decision.
+      operationId: getExpense
+      tags:
+        - Expenses
+      parameters:
+        - name: expenseId
+          in: path
+          required: true
+          description: The unique expense identifier returned from submission
+          schema:
+            type: string
+            example: "EXP-1A2B3C4D5E6F"
+      responses:
+        "200":
+          description: Expense record found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExpenseDecisionResponse"
+        "404":
+          description: Expense not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "Expense EXP-NOTFOUND not found"
+
+  /expenses:
+    get:
+      summary: List all expenses
+      description: |
+        List all processed expense claims. This endpoint is available
+        in the local development server only.
+      operationId: listExpenses
+      tags:
+        - Expenses
+      responses:
+        "200":
+          description: List of all expense records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  expenses:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ExpenseDecisionResponse"
+                  count:
+                    type: integer
+                    example: 3
+
+components:
+  schemas:
+    ExpenseClaimRequest:
+      type: object
+      required:
+        - employeeId
+        - amount
+        - category
+        - description
+        - receiptProvided
+      properties:
+        employeeId:
+          type: string
+          description: Unique employee identifier
+          example: "EMP-001"
+        amount:
+          type: number
+          format: double
+          minimum: 0.01
+          description: Expense amount in USD
+          example: 250.00
+        category:
+          type: string
+          enum:
+            - travel
+            - meals
+            - accommodation
+            - office_supplies
+            - software
+            - training
+            - client_entertainment
+            - transportation
+            - miscellaneous
+          description: Expense category
+          example: "travel"
+        description:
+          type: string
+          minLength: 3
+          description: Description of the expense
+          example: "Flight to NYC for client meeting"
+        receiptProvided:
+          type: boolean
+          description: Whether a receipt was provided
+          example: true
+
+    ExpenseSubmissionResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Expense claim submitted and processed successfully"
+        expenseId:
+          type: string
+          example: "EXP-1A2B3C4D5E6F"
+        submittedAt:
+          type: string
+          format: date-time
+          example: "2026-02-08T10:30:00+00:00"
+        status:
+          type: string
+          enum:
+            - PROCESSING
+            - APPROVED
+            - REJECTED
+            - NEEDS_MANUAL_REVIEW
+          example: "APPROVED"
+
+    ExpenseDecisionResponse:
+      type: object
+      properties:
+        expenseId:
+          type: string
+        employeeId:
+          type: string
+        amount:
+          type: number
+        category:
+          type: string
+        description:
+          type: string
+        receiptProvided:
+          type: boolean
+        submittedAt:
+          type: string
+          format: date-time
+        validation:
+          $ref: "#/components/schemas/ValidationResult"
+        policyCheck:
+          $ref: "#/components/schemas/PolicyCheckResult"
+        fraudCheck:
+          $ref: "#/components/schemas/FraudCheckResult"
+        decision:
+          $ref: "#/components/schemas/DecisionResult"
+        status:
+          type: string
+          enum:
+            - APPROVED
+            - REJECTED
+            - NEEDS_MANUAL_REVIEW
+
+    ValidationResult:
+      type: object
+      properties:
+        passed:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: string
+        validatedAt:
+          type: string
+          format: date-time
+
+    PolicyCheckResult:
+      type: object
+      properties:
+        passed:
+          type: boolean
+        violations:
+          type: array
+          items:
+            type: string
+        checkedAt:
+          type: string
+          format: date-time
+
+    FraudCheckResult:
+      type: object
+      properties:
+        riskScore:
+          type: integer
+          minimum: 0
+          maximum: 100
+        riskLevel:
+          type: string
+          enum:
+            - LOW
+            - MEDIUM
+            - HIGH
+        riskFlags:
+          type: array
+          items:
+            type: string
+        analyzedAt:
+          type: string
+          format: date-time
+
+    DecisionResult:
+      type: object
+      properties:
+        outcome:
+          type: string
+          enum:
+            - APPROVED
+            - REJECTED
+            - NEEDS_MANUAL_REVIEW
+        reasons:
+          type: array
+          items:
+            type: string
+        decidedAt:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Missing required fields: category"
+        detail:
+          type: string
+          example: "Additional error details"

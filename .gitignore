@@ -1,0 +1,30 @@
+# Node.js
+node_modules/
+dist/
+dist.zip
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+
+# Testing
+coverage/
+.jest-cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables (never commit secrets)
+.env
+.env.local
