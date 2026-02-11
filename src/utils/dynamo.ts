@@ -1,13 +1,20 @@
 /**
  * DynamoDB utility module for expense data persistence.
  *
- * Transparently supports three runtime modes:
+ * Supports three runtime modes:
  *  1. AWS deployment (default)  -- real DynamoDB via AWS SDK v3.
  *  2. DynamoDB Local             -- Docker-based local DynamoDB.
  *  3. In-memory fallback         -- plain Map<string, ExpenseEvent>.
  *
- * The DynamoDB Document Client is lazily initialized and reused
- * across invocations within the same Lambda container.
+ * Idempotency:
+ *   storeExpenseDecision uses a DynamoDB conditional expression
+ *   (attribute_not_exists) to prevent duplicate writes. The expense ID
+ *   itself is deterministic (SHA-256 of content fields), so identical
+ *   submissions produce the same ID and are naturally deduplicated.
+ *
+ * Pagination:
+ *   getExpensesByEmployee returns paginated results using DynamoDB's
+ *   ExclusiveStartKey mechanism, exposed as an opaque nextToken.
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -16,8 +23,13 @@ import {
   PutCommand,
   GetCommand,
   QueryCommand,
+  DeleteCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { ExpenseEvent } from "../models/expense";
+import { config } from "./config";
+import { createLogger } from "./logger";
+
+const log = createLogger("DynamoDB");
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -31,16 +43,17 @@ const inMemoryStore = new Map<string, ExpenseEvent>();
 // ---------------------------------------------------------------------------
 
 function getDocClient(): DynamoDBDocumentClient | null {
-  if (process.env.USE_IN_MEMORY === "true") {
-    return null; // Signal to use in-memory store
+  if (config.storageMode === "local" || config.useInMemory) {
+    return null;
   }
 
   if (!docClient) {
-    const clientConfig: Record<string, unknown> = {};
+    const clientConfig: Record<string, unknown> = {
+      region: config.awsRegion,
+    };
 
-    if (process.env.DYNAMODB_ENDPOINT) {
-      clientConfig.endpoint = process.env.DYNAMODB_ENDPOINT;
-      clientConfig.region = process.env.AWS_REGION ?? "us-east-1";
+    if (config.dynamoEndpoint) {
+      clientConfig.endpoint = config.dynamoEndpoint;
     }
 
     const rawClient = new DynamoDBClient(clientConfig);
@@ -57,32 +70,53 @@ function getDocClient(): DynamoDBDocumentClient | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Persist a completed expense decision.
+ * Persist a completed expense decision (idempotent).
  *
- * In production this writes to DynamoDB; locally it stores
- * the record in an in-memory Map.
+ * Uses a conditional write to enforce idempotency:
+ *   - DynamoDB: attribute_not_exists(expenseId) on PutItem
+ *   - In-memory: Map.has() check before insert
+ *
+ * Returns true if the record was written, false if it already existed.
  */
 export async function storeExpenseDecision(
   record: ExpenseEvent,
-): Promise<void> {
+): Promise<boolean> {
   const client = getDocClient();
 
   if (!client) {
+    if (inMemoryStore.has(record.expenseId)) {
+      log.warn("Duplicate write blocked (in-memory)", {
+        expenseId: record.expenseId,
+      });
+      return false;
+    }
     inMemoryStore.set(record.expenseId, { ...record });
-    console.log(`Stored expense ${record.expenseId} in memory`);
-    return;
+    log.info("Stored expense in memory", { expenseId: record.expenseId });
+    return true;
   }
 
-  const tableName = process.env.EXPENSES_TABLE ?? "ExpenseApprovals";
-
-  await client.send(
-    new PutCommand({
-      TableName: tableName,
-      Item: record as unknown as Record<string, unknown>,
-    }),
-  );
-
-  console.log(`Stored expense decision: ${record.expenseId}`);
+  try {
+    await client.send(
+      new PutCommand({
+        TableName: config.expensesTable,
+        Item: record as unknown as Record<string, unknown>,
+        ConditionExpression: "attribute_not_exists(expenseId)",
+      }),
+    );
+    log.info("Stored expense decision", { expenseId: record.expenseId });
+    return true;
+  } catch (err: unknown) {
+    if (
+      err instanceof Error &&
+      err.name === "ConditionalCheckFailedException"
+    ) {
+      log.warn("Duplicate write blocked (DynamoDB conditional)", {
+        expenseId: record.expenseId,
+      });
+      return false;
+    }
+    throw err;
+  }
 }
 
 /**
@@ -97,11 +131,9 @@ export async function getExpense(
     return inMemoryStore.get(expenseId) ?? null;
   }
 
-  const tableName = process.env.EXPENSES_TABLE ?? "ExpenseApprovals";
-
   const result = await client.send(
     new GetCommand({
-      TableName: tableName,
+      TableName: config.expensesTable,
       Key: { expenseId },
     }),
   );
@@ -110,31 +142,145 @@ export async function getExpense(
 }
 
 /**
- * Query all expenses for an employee via the GSI.
+ * Paginated query for all expenses belonging to an employee.
+ *
+ * DynamoDB best practices applied:
+ *   - Uses Query (not Scan) with the EmployeeIndex GSI
+ *   - Limits page size to config.pageSize (default 20)
+ *   - Returns an opaque nextToken for cursor-based pagination
+ *   - Client passes nextToken to retrieve the next page
+ *
+ * @param employeeId  - Employee to query
+ * @param nextToken   - Opaque pagination token (base64-encoded LastEvaluatedKey)
+ * @returns           - Page of expenses + optional nextToken for next page
  */
 export async function getExpensesByEmployee(
   employeeId: string,
-): Promise<ExpenseEvent[]> {
+  nextToken?: string,
+): Promise<{ expenses: ExpenseEvent[]; nextToken?: string }> {
   const client = getDocClient();
 
   if (!client) {
-    return [...inMemoryStore.values()].filter(
-      (e) => e.employeeId === employeeId,
-    );
+    // In-memory: simple filter + simulated pagination.
+    const all = [...inMemoryStore.values()]
+      .filter((e) => e.employeeId === employeeId)
+      .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""));
+
+    const startIdx = nextToken ? parseInt(nextToken, 10) : 0;
+    const page = all.slice(startIdx, startIdx + config.pageSize);
+    const hasMore = startIdx + config.pageSize < all.length;
+
+    return {
+      expenses: page,
+      nextToken: hasMore ? String(startIdx + config.pageSize) : undefined,
+    };
   }
 
-  const tableName = process.env.EXPENSES_TABLE ?? "ExpenseApprovals";
+  // Decode the pagination cursor.
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  if (nextToken) {
+    try {
+      exclusiveStartKey = JSON.parse(
+        Buffer.from(nextToken, "base64").toString("utf-8"),
+      );
+    } catch {
+      log.warn("Invalid pagination token", { nextToken });
+    }
+  }
 
   const result = await client.send(
     new QueryCommand({
-      TableName: tableName,
-      IndexName: "EmployeeIndex",
+      TableName: config.expensesTable,
+      IndexName: config.employeeIndexName,
       KeyConditionExpression: "employeeId = :eid",
       ExpressionAttributeValues: { ":eid": employeeId },
+      Limit: config.pageSize,
+      ExclusiveStartKey: exclusiveStartKey,
     }),
   );
 
-  return (result.Items as ExpenseEvent[]) ?? [];
+  let resultNextToken: string | undefined;
+  if (result.LastEvaluatedKey) {
+    resultNextToken = Buffer.from(
+      JSON.stringify(result.LastEvaluatedKey),
+    ).toString("base64");
+  }
+
+  return {
+    expenses: (result.Items as ExpenseEvent[]) ?? [],
+    nextToken: resultNextToken,
+  };
+}
+
+/**
+ * Update an existing expense record (for manual decisions).
+ *
+ * Merges the provided updates into the existing record.
+ * Returns the updated record, or null if the expense was not found.
+ */
+export async function updateExpenseStatus(
+  expenseId: string,
+  updates: Partial<ExpenseEvent>,
+): Promise<ExpenseEvent | null> {
+  const client = getDocClient();
+
+  if (!client) {
+    const existing = inMemoryStore.get(expenseId);
+    if (!existing) return null;
+    const updated: ExpenseEvent = {
+      ...existing,
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+    inMemoryStore.set(expenseId, updated);
+    return updated;
+  }
+
+  // For DynamoDB, read-modify-write with conditional check.
+  // In production, this should use UpdateExpression for atomicity.
+  // Using PutItem here for simplicity since the full record is small.
+  const existing = await getExpense(expenseId);
+  if (!existing) return null;
+
+  const updated: ExpenseEvent = {
+    ...existing,
+    ...updates,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await client.send(
+    new PutCommand({
+      TableName: config.expensesTable,
+      Item: updated as unknown as Record<string, unknown>,
+    }),
+  );
+
+  return updated;
+}
+
+/**
+ * Delete a single expense record by ID.
+ * Local development only.
+ */
+export async function deleteExpense(expenseId: string): Promise<boolean> {
+  const client = getDocClient();
+
+  if (!client) {
+    return inMemoryStore.delete(expenseId);
+  }
+
+  try {
+    await client.send(
+      new DeleteCommand({
+        TableName: config.expensesTable,
+        Key: { expenseId },
+        ConditionExpression: "attribute_exists(expenseId)",
+      }),
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------

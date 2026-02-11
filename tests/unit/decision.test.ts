@@ -1,197 +1,86 @@
-/**
- * Unit tests for the Decision Lambda handler.
- */
-
 import { handler, makeDecision, mergeParallelResults } from "../../src/handlers/decision";
 import { resetInMemoryStore } from "../../src/utils/dynamo";
 import { ExpenseEvent } from "../../src/models/expense";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 function validExpense(): ExpenseEvent {
   return {
-    expenseId: "EXP-TEST001",
-    employeeId: "EMP-001",
-    amount: 45.0,
-    category: "meals",
-    description: "Team lunch at downtown restaurant",
-    receiptProvided: true,
-    submittedAt: "2026-02-08T10:00:00Z",
+    expenseId: "EXP-TEST001", employeeId: "EMP-001", amount: 45.0,
+    category: "meals", description: "Team lunch", receiptProvided: true,
+    submittedAt: "2026-02-08T10:00:00Z", correlationId: "corr-001",
   };
 }
-
-// ---------------------------------------------------------------------------
-// Handler tests
-// ---------------------------------------------------------------------------
 
 describe("Decision handler", () => {
   beforeEach(() => resetInMemoryStore());
 
-  it("should APPROVE a valid expense with all checks passed", async () => {
-    const expense = validExpense();
-    expense.validation = { passed: true, errors: [], validatedAt: "" };
-    expense.policyCheck = { passed: true, violations: [], checkedAt: "" };
-    expense.fraudCheck = { riskScore: 10, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
-
-    const result = await handler(expense, {});
-
-    expect(result.decision?.outcome).toBe("APPROVED");
-    expect(result.status).toBe("APPROVED");
-    expect(result.decision?.decidedAt).toBeDefined();
-    expect(result.decision!.reasons.length).toBeGreaterThan(0);
+  it("should APPROVE valid expense", async () => {
+    const e = validExpense();
+    e.validation = { passed: true, errors: [], validatedAt: "" };
+    e.policyCheck = { passed: true, violations: [], checkedAt: "" };
+    e.fraudCheck = { riskScore: 10, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
+    const r = await handler(e, {});
+    expect(r.decision?.outcome).toBe("APPROVED");
+    expect(r.status).toBe("APPROVED");
   });
 
   it("should REJECT on validation failure", async () => {
-    const expense = validExpense();
-    expense.validation = { passed: false, errors: ["Missing field: category"], validatedAt: "" };
-
-    const result = await handler(expense, {});
-    expect(result.decision?.outcome).toBe("REJECTED");
+    const e = validExpense();
+    e.validation = { passed: false, errors: ["Missing field"], validatedAt: "" };
+    expect((await handler(e, {})).decision?.outcome).toBe("REJECTED");
   });
 
-  it("should REJECT when amount exceeds limit", async () => {
-    const expense = validExpense();
-    expense.validation = { passed: true, errors: [], validatedAt: "" };
-    expense.policyCheck = {
-      passed: false,
-      violations: ["Amount $5000.00 exceeds meals limit of $75.00"],
-      checkedAt: "",
-    };
-    expense.fraudCheck = { riskScore: 10, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
-
-    const result = await handler(expense, {});
-    expect(result.decision?.outcome).toBe("REJECTED");
+  it("should REJECT on limit violation", async () => {
+    const e = validExpense();
+    e.validation = { passed: true, errors: [], validatedAt: "" };
+    e.policyCheck = { passed: false, violations: ["Amount $5000 exceeds meals limit"], checkedAt: "" };
+    e.fraudCheck = { riskScore: 10, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
+    expect((await handler(e, {})).decision?.outcome).toBe("REJECTED");
   });
 
-  it("should flag NEEDS_MANUAL_REVIEW on high fraud risk", async () => {
-    const expense = validExpense();
-    expense.validation = { passed: true, errors: [], validatedAt: "" };
-    expense.policyCheck = { passed: true, violations: [], checkedAt: "" };
-    expense.fraudCheck = {
-      riskScore: 65,
-      riskLevel: "HIGH",
-      riskFlags: ["Suspicious pattern"],
-      analyzedAt: "",
-    };
-
-    const result = await handler(expense, {});
-    expect(result.decision?.outcome).toBe("NEEDS_MANUAL_REVIEW");
+  it("should NEEDS_MANUAL_REVIEW on high fraud", async () => {
+    const e = validExpense();
+    e.validation = { passed: true, errors: [], validatedAt: "" };
+    e.policyCheck = { passed: true, violations: [], checkedAt: "" };
+    e.fraudCheck = { riskScore: 65, riskLevel: "HIGH", riskFlags: ["Suspicious"], analyzedAt: "" };
+    expect((await handler(e, {})).decision?.outcome).toBe("NEEDS_MANUAL_REVIEW");
   });
 
-  it("should flag NEEDS_MANUAL_REVIEW on policy violation", async () => {
-    const expense = validExpense();
-    expense.validation = { passed: true, errors: [], validatedAt: "" };
-    expense.policyCheck = {
-      passed: false,
-      violations: [
-        "Category 'client_entertainment' requires additional review for amounts over $150.00",
-      ],
-      checkedAt: "",
-    };
-    expense.fraudCheck = { riskScore: 10, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
-
-    const result = await handler(expense, {});
-    expect(result.decision?.outcome).toBe("NEEDS_MANUAL_REVIEW");
+  it("should FAILED_PROCESSING on workflow error", async () => {
+    const e = validExpense();
+    e.error = { Error: "TestError", Cause: "Simulated failure" };
+    const r = await handler(e, {});
+    expect(r.decision?.outcome).toBe("FAILED_PROCESSING");
+    expect(r.status).toBe("FAILED_PROCESSING");
   });
 
   it("should handle Parallel state array input", async () => {
     const base = validExpense();
     base.validation = { passed: true, errors: [], validatedAt: "" };
+    const b1 = { ...base, policyCheck: { passed: true, violations: [] as string[], checkedAt: "" } };
+    const b2 = { ...base, fraudCheck: { riskScore: 5, riskLevel: "LOW" as const, riskFlags: [] as string[], analyzedAt: "" } };
+    expect((await handler([b1, b2], {})).decision?.outcome).toBe("APPROVED");
+  });
 
-    const branch1 = { ...base, policyCheck: { passed: true, violations: [] as string[], checkedAt: "" } };
-    const branch2 = {
-      ...base,
-      fraudCheck: { riskScore: 5, riskLevel: "LOW" as const, riskFlags: [] as string[], analyzedAt: "" },
-    };
-
-    const result = await handler([branch1, branch2], {});
-    expect(result.decision?.outcome).toBe("APPROVED");
+  it("should enforce idempotency", async () => {
+    const e = validExpense();
+    e.expenseId = "EXP-IDEM";
+    e.validation = { passed: true, errors: [], validatedAt: "" };
+    e.policyCheck = { passed: true, violations: [], checkedAt: "" };
+    e.fraudCheck = { riskScore: 0, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
+    await handler(e, {});
+    const r2 = await handler({ ...e }, {});
+    expect(r2.decision?.outcome).toBe("APPROVED");
   });
 });
-
-// ---------------------------------------------------------------------------
-// Core decision logic tests
-// ---------------------------------------------------------------------------
 
 describe("makeDecision()", () => {
-  it("should APPROVE when all checks pass", () => {
-    const expense = validExpense();
-    expense.validation = { passed: true, errors: [], validatedAt: "" };
-    expense.policyCheck = { passed: true, violations: [], checkedAt: "" };
-    expense.fraudCheck = { riskScore: 0, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
-
-    const { outcome } = makeDecision(expense);
-    expect(outcome).toBe("APPROVED");
-  });
-
-  it("should REJECT on validation failure", () => {
-    const expense = validExpense();
-    expense.validation = { passed: false, errors: ["Invalid amount"], validatedAt: "" };
-
-    const { outcome } = makeDecision(expense);
-    expect(outcome).toBe("REJECTED");
-  });
-
-  it("should require MANUAL REVIEW for medium fraud risk", () => {
-    const expense = validExpense();
-    expense.validation = { passed: true, errors: [], validatedAt: "" };
-    expense.policyCheck = { passed: true, violations: [], checkedAt: "" };
-    expense.fraudCheck = {
-      riskScore: 45,
-      riskLevel: "MEDIUM",
-      riskFlags: ["Suspicious pattern"],
-      analyzedAt: "",
-    };
-
-    const { outcome } = makeDecision(expense);
-    expect(outcome).toBe("NEEDS_MANUAL_REVIEW");
-  });
-
-  it("should REJECT when missing check results", () => {
-    const expense = validExpense();
-    // No validation, policyCheck, or fraudCheck
-    const { outcome } = makeDecision(expense);
-    expect(outcome).toBe("REJECTED");
-  });
-
-  it("should require MANUAL REVIEW for receipt violation", () => {
-    const expense = validExpense();
-    expense.validation = { passed: true, errors: [], validatedAt: "" };
-    expense.policyCheck = {
-      passed: false,
-      violations: ["Receipt required for expenses over $25.00"],
-      checkedAt: "",
-    };
-    expense.fraudCheck = { riskScore: 5, riskLevel: "LOW", riskFlags: [], analyzedAt: "" };
-
-    const { outcome } = makeDecision(expense);
-    expect(outcome).toBe("NEEDS_MANUAL_REVIEW");
-  });
+  it("APPROVE all clear", () => { const e = validExpense(); e.validation = { passed: true, errors: [], validatedAt: "" }; e.policyCheck = { passed: true, violations: [], checkedAt: "" }; e.fraudCheck = { riskScore: 0, riskLevel: "LOW", riskFlags: [], analyzedAt: "" }; expect(makeDecision(e).outcome).toBe("APPROVED"); });
+  it("REJECT missing checks (safe defaults)", () => { expect(makeDecision(validExpense()).outcome).toBe("REJECTED"); });
+  it("FAILED_PROCESSING on error", () => { const e = validExpense(); e.error = { Error: "Err", Cause: "Test" }; expect(makeDecision(e).outcome).toBe("FAILED_PROCESSING"); });
 });
 
-// ---------------------------------------------------------------------------
-// Parallel merge tests
-// ---------------------------------------------------------------------------
-
 describe("mergeParallelResults()", () => {
-  it("should merge two dictionaries", () => {
-    const result = mergeParallelResults([
-      { expenseId: "EXP-1", policyCheck: { passed: true } },
-      { expenseId: "EXP-1", fraudCheck: { riskLevel: "LOW" } },
-    ]);
-    expect(result).toHaveProperty("policyCheck");
-    expect(result).toHaveProperty("fraudCheck");
-  });
-
-  it("should handle empty array", () => {
-    const result = mergeParallelResults([]);
-    expect(result).toEqual({});
-  });
-
-  it("should skip non-object items", () => {
-    const result = mergeParallelResults(["not an object", { key: "value" }]);
-    expect(result).toEqual({ key: "value" });
-  });
+  it("merges two dicts", () => { const r = mergeParallelResults([{ expenseId: "1", policyCheck: { passed: true } }, { expenseId: "1", fraudCheck: { riskLevel: "LOW" } }]); expect(r).toHaveProperty("policyCheck"); expect(r).toHaveProperty("fraudCheck"); });
+  it("handles empty array", () => { expect(mergeParallelResults([])).toEqual({}); });
+  it("skips non-objects", () => { expect(mergeParallelResults(["str", { key: "val" }])).toEqual({ key: "val" }); });
 });

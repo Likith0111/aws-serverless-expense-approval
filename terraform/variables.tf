@@ -43,3 +43,19 @@ variable "log_retention_days" {
   type        = number
   default     = 14
 }
+
+# ---------------------------------------------------------------------------
+# API Gateway throttling
+# ---------------------------------------------------------------------------
+
+variable "api_throttle_rate_limit" {
+  description = "Maximum sustained request rate (requests/second) for API Gateway"
+  type        = number
+  default     = 10
+}
+
+variable "api_throttle_burst_limit" {
+  description = "Maximum burst request count for API Gateway"
+  type        = number
+  default     = 20
+}

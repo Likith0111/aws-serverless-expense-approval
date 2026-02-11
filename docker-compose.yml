@@ -1,22 +1,23 @@
-# Optional: DynamoDB Local for integration testing with actual DynamoDB.
-#
-# The default local development server uses in-memory storage and does NOT
-# require Docker. This file is provided for cases where you want to test
-# against a real DynamoDB-compatible engine.
+# DynamoDB Local for integration testing with real DynamoDB protocol.
 #
 # Usage:
 #   docker-compose up -d
 #   export DYNAMODB_ENDPOINT=http://localhost:8000
 #   export USE_IN_MEMORY=false
-#   python run_local.py
+#   npm start
 
 version: "3.8"
 
 services:
   dynamodb-local:
     image: amazon/dynamodb-local:latest
-    container_name: expense-dynamodb-local
+    container_name: expense-dynamodb
     ports:
       - "8000:8000"
-    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb"]
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
     restart: unless-stopped
+
+volumes:
+  dynamodb-data:

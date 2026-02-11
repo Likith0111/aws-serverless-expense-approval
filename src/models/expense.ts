@@ -25,6 +25,22 @@ export const ALLOWED_CATEGORIES = [
 
 export type ExpenseCategory = (typeof ALLOWED_CATEGORIES)[number];
 
+/** All possible decision outcomes rendered by the workflow. */
+export type DecisionOutcome =
+  | "APPROVED"
+  | "REJECTED"
+  | "NEEDS_MANUAL_REVIEW"
+  | "FAILED_PROCESSING";
+
+/** All possible statuses an expense record can have. */
+export type ExpenseStatus =
+  | "PROCESSING"
+  | "APPROVED"
+  | "REJECTED"
+  | "NEEDS_MANUAL_REVIEW"
+  | "PENDING_REVIEW"
+  | "FAILED_PROCESSING";
+
 // ---------------------------------------------------------------------------
 // Workflow step results
 // ---------------------------------------------------------------------------
@@ -49,9 +65,23 @@ export interface FraudCheckResult {
 }
 
 export interface DecisionResult {
-  outcome: "APPROVED" | "REJECTED" | "NEEDS_MANUAL_REVIEW";
+  outcome: DecisionOutcome;
   reasons: string[];
   decidedAt: string;
+  /** True when a human reviewer overrode the automated decision. */
+  manualOverride?: boolean;
+  /** Identifier of the reviewer (set only for manual decisions). */
+  reviewedBy?: string;
+}
+
+/**
+ * Error payload attached by Step Functions Catch blocks.
+ * The Catch ResultPath merges this into the event so the
+ * compensation handler can log and persist the failure.
+ */
+export interface WorkflowError {
+  Error: string;
+  Cause: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +96,21 @@ export interface ExpenseEvent {
   description: string;
   receiptProvided: boolean;
   submittedAt: string;
+
+  /**
+   * Unique per-request identifier for distributed tracing.
+   * Generated once in the API handler and carried through
+   * every Step Functions state. Different from expenseId which
+   * is deterministic for idempotency.
+   */
+  correlationId?: string;
+
+  /**
+   * Workflow version that processed this expense ("V1" or "V2").
+   * V2 adds a manual approval wait state for NEEDS_MANUAL_REVIEW.
+   */
+  workflowVersion?: string;
+
   validation?: ValidationResult;
   policyCheck?: PolicyCheckResult;
   fraudCheck?: FraudCheckResult;
@@ -73,6 +118,9 @@ export interface ExpenseEvent {
   status?: string;
   updatedAt?: string;
   storageError?: string;
+
+  /** Error from Step Functions Catch block (compensation flow). */
+  error?: WorkflowError;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +138,19 @@ export interface ExpenseClaimRequest {
 export interface SubmissionResponse {
   message: string;
   expenseId: string;
+  correlationId: string;
   submittedAt: string;
   status: string;
+  workflowVersion: string;
+}
+
+/**
+ * Request body for the manual decision endpoint.
+ * Used when a human reviewer approves or rejects an expense
+ * that was flagged as NEEDS_MANUAL_REVIEW.
+ */
+export interface ManualDecisionRequest {
+  decision: "APPROVED" | "REJECTED";
+  reason: string;
+  reviewedBy?: string;
 }

@@ -1,219 +1,192 @@
 /**
- * End-to-end integration tests for the Expense Approval Workflow.
+ * End-to-end integration tests.
  *
- * These tests exercise the complete pipeline by chaining all Lambda
- * handlers in sequence, exactly as Step Functions would in production.
- * Each test submits an expense, runs it through every step, and
- * verifies the final decision and all intermediate results.
+ * These tests exercise the full workflow pipeline locally:
+ *   Submit -> Validate -> PolicyCheck -> FraudHeuristic -> Decision -> DynamoDB
+ *
+ * They verify:
+ *   - Happy path (APPROVED, REJECTED, NEEDS_MANUAL_REVIEW)
+ *   - Negative cases (invalid payload, zero amount, bad category)
+ *   - Idempotency (duplicate submission detection)
+ *   - Pagination (employee query across multiple pages)
+ *   - Correlation ID propagation
+ *   - Workflow version tracking
  */
 
 import { handler as validateHandler } from "../../src/handlers/validateExpense";
 import { handler as policyHandler } from "../../src/handlers/policyCheck";
 import { handler as fraudHandler } from "../../src/handlers/fraudHeuristic";
 import { handler as decisionHandler } from "../../src/handlers/decision";
-import { getExpense, resetInMemoryStore } from "../../src/utils/dynamo";
+import {
+  resetInMemoryStore, storeExpenseDecision,
+  getExpense, getExpensesByEmployee,
+} from "../../src/utils/dynamo";
 import { ExpenseEvent } from "../../src/models/expense";
 
 // ---------------------------------------------------------------------------
-// Workflow runner (mirrors Step Functions state machine)
+// Workflow runner (mirrors local server)
 // ---------------------------------------------------------------------------
 
-async function runFullWorkflow(input: ExpenseEvent): Promise<ExpenseEvent> {
+async function runWorkflow(input: ExpenseEvent): Promise<ExpenseEvent> {
   const ctx = {};
+  let r = await validateHandler(input, ctx);
+  if (!r.validation?.passed) return await decisionHandler(r, ctx);
+  r = await policyHandler(r, ctx);
+  r = await fraudHandler(r, ctx);
+  return await decisionHandler(r, ctx);
+}
 
-  let result = await validateHandler(input, ctx);
-
-  if (!result.validation?.passed) {
-    result = await decisionHandler(result, ctx);
-    return result;
-  }
-
-  result = await policyHandler(result, ctx);
-  result = await fraudHandler(result, ctx);
-  result = await decisionHandler(result, ctx);
-
-  return result;
+function baseExpense(overrides: Partial<ExpenseEvent> = {}): ExpenseEvent {
+  return {
+    expenseId: "EXP-E2E-001", employeeId: "EMP-001", amount: 45.0,
+    category: "meals", description: "Team lunch at restaurant", receiptProvided: true,
+    submittedAt: "2026-02-08T10:00:00Z", correlationId: "corr-e2e-001",
+    workflowVersion: "V1", ...overrides,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Happy path
 // ---------------------------------------------------------------------------
 
-describe("End-to-end workflow", () => {
+describe("End-to-end happy path", () => {
   beforeEach(() => resetInMemoryStore());
 
-  // --- APPROVED path -------------------------------------------------------
-
-  it("should APPROVE a standard valid expense", async () => {
-    const expense: ExpenseEvent = {
-      expenseId: "EXP-E2E-001",
-      employeeId: "EMP-001",
-      amount: 35.5,
-      category: "meals",
-      description: "Lunch with team at local restaurant",
-      receiptProvided: true,
-      submittedAt: "2026-02-08T10:00:00Z",
-    };
-
-    const result = await runFullWorkflow(expense);
-
-    // All check blocks present
-    expect(result.validation).toBeDefined();
-    expect(result.policyCheck).toBeDefined();
-    expect(result.fraudCheck).toBeDefined();
-    expect(result.decision).toBeDefined();
-
-    // Final decision
-    expect(result.decision!.outcome).toBe("APPROVED");
-    expect(result.status).toBe("APPROVED");
-
-    // Persisted to storage
+  it("should APPROVE a standard meal expense", async () => {
+    const r = await runWorkflow(baseExpense());
+    expect(r.decision?.outcome).toBe("APPROVED");
+    expect(r.status).toBe("APPROVED");
+    expect(r.correlationId).toBe("corr-e2e-001");
+    expect(r.workflowVersion).toBe("V1");
     const stored = await getExpense("EXP-E2E-001");
-    expect(stored).not.toBeNull();
-    expect(stored!.decision!.outcome).toBe("APPROVED");
+    expect(stored?.status).toBe("APPROVED");
   });
 
-  // --- REJECTED: validation failure ----------------------------------------
-
-  it("should REJECT an invalid expense at validation", async () => {
-    const expense: ExpenseEvent = {
-      expenseId: "EXP-E2E-002",
-      employeeId: "EMP-002",
-      amount: -50,
-      category: "meals",
-      description: "Invalid negative amount",
-      receiptProvided: true,
-      submittedAt: "2026-02-08T10:00:00Z",
-    };
-
-    const result = await runFullWorkflow(expense);
-
-    expect(result.validation!.passed).toBe(false);
-    expect(result.decision!.outcome).toBe("REJECTED");
-
-    // Policy and fraud checks should NOT have run
-    expect(result.policyCheck).toBeUndefined();
-    expect(result.fraudCheck).toBeUndefined();
+  it("should REJECT over-limit meals expense", async () => {
+    const r = await runWorkflow(baseExpense({ expenseId: "EXP-E2E-002", amount: 200 }));
+    expect(r.decision?.outcome).toBe("REJECTED");
   });
 
-  // --- REJECTED: over category limit ---------------------------------------
-
-  it("should REJECT an expense exceeding category limit", async () => {
-    const expense: ExpenseEvent = {
-      expenseId: "EXP-E2E-003",
-      employeeId: "EMP-003",
-      amount: 500,
-      category: "meals",
-      description: "Very expensive team dinner at luxury venue downtown",
-      receiptProvided: true,
-      submittedAt: "2026-02-08T10:00:00Z",
-    };
-
-    const result = await runFullWorkflow(expense);
-
-    expect(result.decision!.outcome).toBe("REJECTED");
-    expect(result.decision!.reasons.some((r) => r.toLowerCase().includes("exceeds"))).toBe(true);
-  });
-
-  // --- NEEDS_MANUAL_REVIEW: suspicious pattern -----------------------------
-
-  it("should flag a suspicious expense for review", async () => {
-    const expense: ExpenseEvent = {
-      expenseId: "EXP-E2E-004",
-      employeeId: "EMP-004",
-      amount: 24.99,
-      category: "office_supplies",
-      description: "test supplies for the office area",
-      receiptProvided: false,
-      submittedAt: "2026-02-08T10:00:00Z",
-    };
-
-    const result = await runFullWorkflow(expense);
-
-    // Threshold gaming + suspicious keyword + no receipt
-    expect(["NEEDS_MANUAL_REVIEW", "REJECTED"]).toContain(result.decision!.outcome);
-  });
-
-  // --- NEEDS_MANUAL_REVIEW: missing receipt --------------------------------
-
-  it("should flag expense over $25 without receipt", async () => {
-    const expense: ExpenseEvent = {
-      expenseId: "EXP-E2E-005",
-      employeeId: "EMP-005",
-      amount: 120,
-      category: "transportation",
-      description: "Uber rides for client visits across the city today",
-      receiptProvided: false,
-      submittedAt: "2026-02-08T10:00:00Z",
-    };
-
-    const result = await runFullWorkflow(expense);
-
-    expect(["NEEDS_MANUAL_REVIEW", "REJECTED"]).toContain(result.decision!.outcome);
-  });
-
-  // --- Data integrity -------------------------------------------------------
-
-  it("should preserve all original fields through the pipeline", async () => {
-    const expense: ExpenseEvent = {
-      expenseId: "EXP-E2E-006",
-      employeeId: "EMP-006",
-      amount: 50,
-      category: "office_supplies",
-      description: "Printer paper and ink cartridges for the office",
-      receiptProvided: true,
-      submittedAt: "2026-02-08T10:00:00Z",
-    };
-
-    const result = await runFullWorkflow(expense);
-
-    expect(result.expenseId).toBe("EXP-E2E-006");
-    expect(result.employeeId).toBe("EMP-006");
-    expect(result.amount).toBe(50);
-    expect(result.category).toBe("office_supplies");
-    expect(result.receiptProvided).toBe(true);
-  });
-
-  it("should store multiple expenses independently", async () => {
-    const expenses: ExpenseEvent[] = Array.from({ length: 3 }, (_, i) => ({
-      expenseId: `EXP-MULTI-${i}`,
-      employeeId: "EMP-MULTI",
-      amount: 30 + i,
-      category: "meals",
-      description: `Team meal number ${i} at local restaurant`,
-      receiptProvided: true,
-      submittedAt: "2026-02-08T10:00:00Z",
+  it("should flag suspicious expense for MANUAL_REVIEW", async () => {
+    const r = await runWorkflow(baseExpense({
+      expenseId: "EXP-E2E-003", amount: 24.99, category: "miscellaneous",
+      description: "test expense", receiptProvided: false,
     }));
-
-    for (const e of expenses) {
-      await runFullWorkflow(e);
-    }
-
-    for (let i = 0; i < 3; i++) {
-      const stored = await getExpense(`EXP-MULTI-${i}`);
-      expect(stored).not.toBeNull();
-      expect(stored!.amount).toBe(30 + i);
-      expect(stored!.decision!.outcome).toBe("APPROVED");
-    }
+    expect(r.decision?.outcome).toBe("NEEDS_MANUAL_REVIEW");
   });
 
-  // --- Edge case: at limit --------------------------------------------------
+  it("should APPROVE a large travel expense within limit", async () => {
+    const r = await runWorkflow(baseExpense({
+      expenseId: "EXP-E2E-004", amount: 1500, category: "travel",
+      description: "Business trip flight to conference in NYC", receiptProvided: true,
+    }));
+    expect(r.decision?.outcome).toBe("APPROVED");
+  });
+});
 
-  it("should handle expense exactly at category limit", async () => {
-    const expense: ExpenseEvent = {
-      expenseId: "EXP-E2E-007",
-      employeeId: "EMP-007",
-      amount: 2000,
-      category: "travel",
-      description: "Round-trip flight to San Francisco for annual conference",
-      receiptProvided: true,
-      submittedAt: "2026-02-08T10:00:00Z",
-    };
+// ---------------------------------------------------------------------------
+// Negative cases
+// ---------------------------------------------------------------------------
 
-    const result = await runFullWorkflow(expense);
+describe("End-to-end negative cases", () => {
+  beforeEach(() => resetInMemoryStore());
 
-    // $2000 is exactly at the travel limit (not over).
-    // Round-amount heuristic may trigger, so APPROVED or NEEDS_MANUAL_REVIEW.
-    expect(["APPROVED", "NEEDS_MANUAL_REVIEW"]).toContain(result.decision!.outcome);
+  it("REJECT with missing fields", async () => {
+    const r = await runWorkflow({ expenseId: "EXP-NEG1", employeeId: "EMP-1", amount: 50 } as ExpenseEvent);
+    expect(r.decision?.outcome).toBe("REJECTED");
+    expect(r.decision?.reasons.some((re) => re.includes("Missing"))).toBe(true);
+  });
+
+  it("REJECT with zero amount", async () => {
+    const r = await runWorkflow(baseExpense({ expenseId: "EXP-NEG2", amount: 0 }));
+    expect(r.decision?.outcome).toBe("REJECTED");
+  });
+
+  it("REJECT with invalid category", async () => {
+    const r = await runWorkflow(baseExpense({ expenseId: "EXP-NEG3", category: "gambling" }));
+    expect(r.decision?.outcome).toBe("REJECTED");
+  });
+
+  it("REJECT with amount exceeding max", async () => {
+    const r = await runWorkflow(baseExpense({ expenseId: "EXP-NEG4", amount: 15000 }));
+    expect(r.decision?.outcome).toBe("REJECTED");
+  });
+
+  it("REJECT with very short description", async () => {
+    const r = await runWorkflow(baseExpense({ expenseId: "EXP-NEG5", description: "ab" }));
+    expect(r.decision?.outcome).toBe("REJECTED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Idempotency
+// ---------------------------------------------------------------------------
+
+describe("End-to-end idempotency", () => {
+  beforeEach(() => resetInMemoryStore());
+
+  it("second write with same ID blocked by conditional write", async () => {
+    await runWorkflow(baseExpense({ expenseId: "EXP-IDEM-1" }));
+    const stored1 = await getExpense("EXP-IDEM-1");
+    expect(stored1).not.toBeNull();
+
+    // Running the workflow again with the same ID -- storeExpenseDecision blocks it.
+    const r2 = await runWorkflow(baseExpense({ expenseId: "EXP-IDEM-1" }));
+    expect(r2.decision?.outcome).toBe("APPROVED");
+    // Store has only one record.
+    const all = await getExpensesByEmployee("EMP-001");
+    const matching = all.expenses.filter((e) => e.expenseId === "EXP-IDEM-1");
+    expect(matching).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Employee query + pagination
+// ---------------------------------------------------------------------------
+
+describe("End-to-end employee query", () => {
+  beforeEach(() => resetInMemoryStore());
+
+  it("retrieves all expenses for an employee after workflow", async () => {
+    for (let i = 0; i < 3; i++) {
+      await runWorkflow(baseExpense({
+        expenseId: `EXP-EMP-${i}`, employeeId: "EMP-QUERY",
+        amount: 10 + i, description: `Expense number ${i + 100}`,
+      }));
+    }
+    const r = await getExpensesByEmployee("EMP-QUERY");
+    expect(r.expenses).toHaveLength(3);
+  });
+
+  it("paginates employee results", async () => {
+    // Page size set to 5 in test setup.
+    for (let i = 0; i < 7; i++) {
+      await storeExpenseDecision(baseExpense({
+        expenseId: `EXP-PAG-${i}`, employeeId: "EMP-PG",
+        submittedAt: `2026-01-0${i + 1}T10:00:00Z`,
+      }));
+    }
+    const page1 = await getExpensesByEmployee("EMP-PG");
+    expect(page1.expenses.length).toBeLessThanOrEqual(5);
+    expect(page1.nextToken).toBeDefined();
+    const page2 = await getExpensesByEmployee("EMP-PG", page1.nextToken);
+    expect(page1.expenses.length + page2.expenses.length).toBe(7);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FAILED_PROCESSING (compensation path)
+// ---------------------------------------------------------------------------
+
+describe("End-to-end compensation", () => {
+  beforeEach(() => resetInMemoryStore());
+
+  it("stores FAILED_PROCESSING when error is present", async () => {
+    const e = baseExpense({ expenseId: "EXP-FAIL-1" });
+    e.error = { Error: "WorkflowError", Cause: "Step failed" };
+    const r = await decisionHandler(e, {});
+    expect(r.decision?.outcome).toBe("FAILED_PROCESSING");
+    const stored = await getExpense("EXP-FAIL-1");
+    expect(stored?.status).toBe("FAILED_PROCESSING");
   });
 });

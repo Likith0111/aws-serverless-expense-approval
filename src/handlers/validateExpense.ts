@@ -9,7 +9,7 @@
  *  - All required fields must be present and non-null.
  *  - Amount must be a positive number within reasonable bounds.
  *  - Category must be from the approved corporate list.
- *  - Description must be meaningful (>= 3 characters).
+ *  - Description must be meaningful (>= 3 characters after sanitization).
  *  - receiptProvided must be a boolean.
  *
  * Architectural note:
@@ -18,6 +18,9 @@
  */
 
 import { ExpenseEvent, ALLOWED_CATEGORIES } from "../models/expense";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("ValidateExpense");
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -43,7 +46,11 @@ export const handler = async (
   event: ExpenseEvent,
   _context: unknown,
 ): Promise<ExpenseEvent> => {
-  console.log(`Validating expense claim: ${event.expenseId ?? "unknown"}`);
+  log.info("Starting expense validation", {
+    expenseId: event.expenseId,
+    correlationId: event.correlationId,
+    employeeId: event.employeeId,
+  });
 
   const errors = validate(event);
 
@@ -53,11 +60,19 @@ export const handler = async (
     validatedAt: new Date().toISOString(),
   };
 
-  console.log(
-    `Validation ${errors.length === 0 ? "passed" : "failed"} for ${event.expenseId}: ${
-      errors.length > 0 ? errors.join("; ") : "no issues"
-    }`,
-  );
+  if (errors.length > 0) {
+    log.warn("Validation failed", {
+      expenseId: event.expenseId,
+      correlationId: event.correlationId,
+      errorCount: errors.length,
+      errors,
+    });
+  } else {
+    log.info("Validation passed", {
+      expenseId: event.expenseId,
+      correlationId: event.correlationId,
+    });
+  }
 
   return event;
 };
@@ -67,8 +82,6 @@ export const handler = async (
 // ---------------------------------------------------------------------------
 
 export function validate(expense: Record<string, unknown> | ExpenseEvent): string[] {
-  // Work with a loosely-typed reference so field access is uniform
-  // regardless of whether the caller passes an interface or a plain object.
   const e = expense as Record<string, unknown>;
   const errors: string[] = [];
 
@@ -79,8 +92,6 @@ export function validate(expense: Record<string, unknown> | ExpenseEvent): strin
     }
   }
 
-  // If required fields are missing, skip further checks because downstream
-  // validations would produce misleading errors.
   if (errors.length > 0) return errors;
 
   // --- employeeId -----------------------------------------------------------

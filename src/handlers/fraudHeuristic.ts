@@ -6,6 +6,14 @@
  * machine learning -- it uses rules derived from common corporate
  * fraud patterns.
  *
+ * Chaos engineering:
+ *   When config.chaosEnabled is true, expenses with amounts ending
+ *   in .13 will throw a simulated error. This allows testing of:
+ *     - Step Functions retry logic (exponential backoff)
+ *     - Catch blocks and compensation handlers
+ *     - End-to-end failure recovery paths
+ *   The trigger amount (.13) is deterministic so tests are reliable.
+ *
  * Heuristic rules and point values:
  *   - Suspiciously round amounts ($500.00 exactly)        +15 pts
  *   - Threshold gaming (just below policy limits)         +25 pts
@@ -21,26 +29,25 @@
  */
 
 import { ExpenseEvent } from "../models/expense";
+import { config } from "../utils/config";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("FraudHeuristic");
 
 // ---------------------------------------------------------------------------
 // Scoring thresholds
 // ---------------------------------------------------------------------------
 
 const RISK_THRESHOLD_LOW = 30;
-const RISK_THRESHOLD_MEDIUM = 60; // >= 60 is HIGH
+const RISK_THRESHOLD_MEDIUM = 60;
 
 // ---------------------------------------------------------------------------
 // Heuristic parameters
 // ---------------------------------------------------------------------------
 
-/** Dollar amounts that are "too perfect". */
 const ROUND_AMOUNTS = [50, 100, 200, 250, 500, 750, 1000, 1500, 2000, 5000];
 const ROUND_AMOUNT_TOLERANCE = 0.001;
 
-/**
- * Amounts suspiciously close to known policy limits.
- * Key = target amount, Value = explanation.
- */
 const THRESHOLD_AMOUNTS: Record<number, string> = {
   24.99: "Just below receipt threshold ($25)",
   74.99: "Just below meals limit ($75)",
@@ -50,12 +57,10 @@ const THRESHOLD_AMOUNTS: Record<number, string> = {
 };
 const THRESHOLD_TOLERANCE = 1.0;
 
-/** Keywords suggesting test data or low-effort descriptions. */
 const SUSPICIOUS_KEYWORDS = [
   "test", "asdf", "xxx", "fake", "dummy", "n/a", "none", "misc",
 ];
 
-/** Single-word generic descriptions that warrant scrutiny. */
 const GENERIC_PATTERNS = [
   /^expense$/i,
   /^claim$/i,
@@ -64,7 +69,6 @@ const GENERIC_PATTERNS = [
   /^work$/i,
 ];
 
-/** Typical spend by category -- amounts far above these are unusual. */
 const CATEGORY_NORMS: Record<string, number> = {
   meals: 50,
   transportation: 75,
@@ -79,9 +83,24 @@ export const handler = async (
   event: ExpenseEvent,
   _context: unknown,
 ): Promise<ExpenseEvent> => {
-  console.log(
-    `Running fraud heuristics for expense: ${event.expenseId ?? "unknown"}`,
-  );
+  log.info("Starting fraud analysis", {
+    expenseId: event.expenseId,
+    correlationId: event.correlationId,
+    amount: event.amount,
+    category: event.category,
+  });
+
+  // --- Chaos injection (deterministic) ------------------------------------
+  // Amounts ending in .13 trigger a simulated failure when chaos mode is on.
+  // This exercises Step Functions retry + Catch block compensation paths.
+  if (config.chaosEnabled && event.amount.toFixed(2).endsWith(".13")) {
+    log.error("CHAOS_INJECTION: Simulated failure triggered", {
+      expenseId: event.expenseId,
+      correlationId: event.correlationId,
+      amount: event.amount,
+    });
+    throw new Error("CHAOS_INJECTION: Simulated FraudHeuristic transient failure");
+  }
 
   const { riskScore, riskFlags } = analyzeFraudRisk(event);
 
@@ -101,9 +120,13 @@ export const handler = async (
     analyzedAt: new Date().toISOString(),
   };
 
-  console.log(
-    `Fraud analysis for ${event.expenseId}: score=${riskScore}, level=${riskLevel}, flags=${riskFlags.length}`,
-  );
+  log.info("Fraud analysis complete", {
+    expenseId: event.expenseId,
+    correlationId: event.correlationId,
+    riskScore,
+    riskLevel,
+    flagCount: riskFlags.length,
+  });
 
   return event;
 };
@@ -121,7 +144,6 @@ export function analyzeFraudRisk(
   const { amount, category, receiptProvided } = expense;
   const description = (expense.description ?? "").toLowerCase().trim();
 
-  // --- Rule 1: Suspiciously round amounts (+15) ----------------------------
   for (const round of ROUND_AMOUNTS) {
     if (Math.abs(amount - round) < ROUND_AMOUNT_TOLERANCE) {
       riskScore += 15;
@@ -130,7 +152,6 @@ export function analyzeFraudRisk(
     }
   }
 
-  // --- Rule 2: Threshold gaming (+25) --------------------------------------
   for (const [thresholdStr, reason] of Object.entries(THRESHOLD_AMOUNTS)) {
     const threshold = parseFloat(thresholdStr);
     if (Math.abs(amount - threshold) < THRESHOLD_TOLERANCE && amount <= threshold) {
@@ -140,16 +161,14 @@ export function analyzeFraudRisk(
     }
   }
 
-  // --- Rule 3: Suspicious keywords (+20) -----------------------------------
   for (const keyword of SUSPICIOUS_KEYWORDS) {
     if (description.includes(keyword)) {
       riskScore += 20;
       riskFlags.push(`Suspicious keyword in description: '${keyword}'`);
-      break; // Only flag once
+      break;
     }
   }
 
-  // --- Rule 4: Generic or very short descriptions (+15) --------------------
   if (description.length < 10) {
     riskScore += 15;
     riskFlags.push("Description is suspiciously short");
@@ -163,13 +182,11 @@ export function analyzeFraudRisk(
     }
   }
 
-  // --- Rule 5: High amount without receipt (+20) ---------------------------
   if (amount > 100 && !receiptProvided) {
     riskScore += 20;
     riskFlags.push("High amount submitted without receipt");
   }
 
-  // --- Rule 6: Category-amount mismatch (+10) ------------------------------
   const norm = CATEGORY_NORMS[category];
   if (norm !== undefined && amount > norm * 2) {
     riskScore += 10;
@@ -178,7 +195,6 @@ export function analyzeFraudRisk(
     );
   }
 
-  // Cap at 100 to avoid misleading scores from edge-case stacking.
   riskScore = Math.min(riskScore, 100);
 
   return { riskScore, riskFlags };

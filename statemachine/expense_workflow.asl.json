@@ -1,21 +1,17 @@
 {
-  "Comment": "Intelligent Expense Approval Workflow -- validates claims, checks policies, detects fraud, and renders approval decisions.",
+  "Comment": "ExpenseApprovalV1 -- Validates, checks policy, detects fraud, renders decision. Includes retry with exponential backoff and catch-block compensation.",
   "StartAt": "ValidateExpense",
   "States": {
 
     "ValidateExpense": {
       "Type": "Task",
       "Resource": "${ValidateExpenseFunctionArn}",
-      "Comment": "Validate the expense claim structure, data types, and field values.",
+      "Comment": "Validate expense claim structure, types, and field values.",
       "ResultPath": "$",
       "Next": "IsValidExpense",
       "Retry": [
         {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException",
-            "Lambda.SdkClientException"
-          ],
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
           "IntervalSeconds": 2,
           "MaxAttempts": 2,
           "BackoffRate": 2.0
@@ -25,14 +21,14 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
-          "Next": "WorkflowFailed"
+          "Next": "HandleProcessingFailure"
         }
       ]
     },
 
     "IsValidExpense": {
       "Type": "Choice",
-      "Comment": "Short-circuit to decision if validation failed -- no point running further checks on invalid data.",
+      "Comment": "Short-circuit invalid claims directly to decision -- no point running further checks.",
       "Choices": [
         {
           "Variable": "$.validation.passed",
@@ -45,7 +41,7 @@
 
     "RunParallelChecks": {
       "Type": "Parallel",
-      "Comment": "Run PolicyCheck and FraudHeuristic concurrently. This reduces overall workflow latency and demonstrates Step Functions parallelism.",
+      "Comment": "Run PolicyCheck and FraudHeuristic concurrently to reduce latency.",
       "Branches": [
         {
           "StartAt": "PolicyCheck",
@@ -53,14 +49,10 @@
             "PolicyCheck": {
               "Type": "Task",
               "Resource": "${PolicyCheckFunctionArn}",
-              "Comment": "Evaluate expense against corporate category limits and receipt policies.",
               "End": true,
               "Retry": [
                 {
-                  "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.AWSLambdaException"
-                  ],
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
                   "IntervalSeconds": 2,
                   "MaxAttempts": 2,
                   "BackoffRate": 2.0
@@ -75,16 +67,12 @@
             "FraudHeuristic": {
               "Type": "Task",
               "Resource": "${FraudHeuristicFunctionArn}",
-              "Comment": "Apply rule-based heuristics to detect anomalous expense patterns.",
               "End": true,
               "Retry": [
                 {
-                  "ErrorEquals": [
-                    "Lambda.ServiceException",
-                    "Lambda.AWSLambdaException"
-                  ],
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "States.TaskFailed"],
                   "IntervalSeconds": 2,
-                  "MaxAttempts": 2,
+                  "MaxAttempts": 3,
                   "BackoffRate": 2.0
                 }
               ]
@@ -98,7 +86,7 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
-          "Next": "WorkflowFailed"
+          "Next": "HandleProcessingFailure"
         }
       ]
     },
@@ -106,15 +94,12 @@
     "RejectInvalidExpense": {
       "Type": "Task",
       "Resource": "${DecisionFunctionArn}",
-      "Comment": "Render a REJECTED decision for expenses that failed validation.",
+      "Comment": "Render REJECTED decision for invalid expenses.",
       "ResultPath": "$",
       "End": true,
       "Retry": [
         {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException"
-          ],
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
           "IntervalSeconds": 2,
           "MaxAttempts": 2,
           "BackoffRate": 2.0
@@ -124,7 +109,7 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
-          "Next": "WorkflowFailed"
+          "Next": "HandleProcessingFailure"
         }
       ]
     },
@@ -132,15 +117,12 @@
     "MakeDecision": {
       "Type": "Task",
       "Resource": "${DecisionFunctionArn}",
-      "Comment": "Aggregate all check results and determine the final approval decision.",
+      "Comment": "Aggregate all results and render final approval decision.",
       "ResultPath": "$",
       "End": true,
       "Retry": [
         {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.AWSLambdaException"
-          ],
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
           "IntervalSeconds": 2,
           "MaxAttempts": 2,
           "BackoffRate": 2.0
@@ -150,15 +132,17 @@
         {
           "ErrorEquals": ["States.ALL"],
           "ResultPath": "$.error",
-          "Next": "WorkflowFailed"
+          "Next": "HandleProcessingFailure"
         }
       ]
     },
 
-    "WorkflowFailed": {
-      "Type": "Fail",
-      "Error": "WorkflowExecutionError",
-      "Cause": "An unrecoverable error occurred during expense approval processing."
+    "HandleProcessingFailure": {
+      "Type": "Task",
+      "Resource": "${DecisionFunctionArn}",
+      "Comment": "Compensation handler: persists FAILED_PROCESSING when any step fails after retries. Uses the Decision Lambda with the error context to store an auditable failure record.",
+      "ResultPath": "$",
+      "End": true
     }
   }
 }

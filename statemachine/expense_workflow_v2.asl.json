@@ -1,0 +1,184 @@
+{
+  "Comment": "ExpenseApprovalV2 -- Same as V1 but adds a manual approval wait state. When the Decision step returns NEEDS_MANUAL_REVIEW, the workflow pauses and waits for an external signal (SendTaskSuccess) from a human reviewer.",
+  "StartAt": "ValidateExpense",
+  "States": {
+
+    "ValidateExpense": {
+      "Type": "Task",
+      "Resource": "${ValidateExpenseFunctionArn}",
+      "ResultPath": "$",
+      "Next": "IsValidExpense",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "HandleProcessingFailure"
+        }
+      ]
+    },
+
+    "IsValidExpense": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validation.passed",
+          "BooleanEquals": false,
+          "Next": "RejectInvalidExpense"
+        }
+      ],
+      "Default": "RunParallelChecks"
+    },
+
+    "RunParallelChecks": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "PolicyCheck",
+          "States": {
+            "PolicyCheck": {
+              "Type": "Task",
+              "Resource": "${PolicyCheckFunctionArn}",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ]
+            }
+          }
+        },
+        {
+          "StartAt": "FraudHeuristic",
+          "States": {
+            "FraudHeuristic": {
+              "Type": "Task",
+              "Resource": "${FraudHeuristicFunctionArn}",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "ResultPath": "$",
+      "Next": "MakeDecision",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "HandleProcessingFailure"
+        }
+      ]
+    },
+
+    "RejectInvalidExpense": {
+      "Type": "Task",
+      "Resource": "${DecisionFunctionArn}",
+      "ResultPath": "$",
+      "End": true,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "HandleProcessingFailure"
+        }
+      ]
+    },
+
+    "MakeDecision": {
+      "Type": "Task",
+      "Resource": "${DecisionFunctionArn}",
+      "Comment": "Render the automated decision. If NEEDS_MANUAL_REVIEW, route to wait state.",
+      "ResultPath": "$",
+      "Next": "CheckIfManualReview",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "HandleProcessingFailure"
+        }
+      ]
+    },
+
+    "CheckIfManualReview": {
+      "Type": "Choice",
+      "Comment": "V2 addition: route NEEDS_MANUAL_REVIEW to a wait state for human approval.",
+      "Choices": [
+        {
+          "Variable": "$.status",
+          "StringEquals": "NEEDS_MANUAL_REVIEW",
+          "Next": "WaitForManualApproval"
+        }
+      ],
+      "Default": "WorkflowComplete"
+    },
+
+    "WaitForManualApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Comment": "Pauses the workflow until a human reviewer calls SendTaskSuccess. The task token is stored in DynamoDB for the manual-decision API to retrieve.",
+      "Parameters": {
+        "FunctionName": "${StoreTaskTokenFunctionArn}",
+        "Payload": {
+          "expenseId.$": "$.expenseId",
+          "correlationId.$": "$.correlationId",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "TimeoutSeconds": 604800,
+      "Next": "WorkflowComplete",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "ResultPath": "$.error",
+          "Next": "HandleProcessingFailure"
+        }
+      ]
+    },
+
+    "WorkflowComplete": {
+      "Type": "Succeed"
+    },
+
+    "HandleProcessingFailure": {
+      "Type": "Task",
+      "Resource": "${DecisionFunctionArn}",
+      "Comment": "Compensation: persist FAILED_PROCESSING for auditing and operator visibility.",
+      "ResultPath": "$",
+      "End": true
+    }
+  }
+}

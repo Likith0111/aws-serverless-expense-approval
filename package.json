@@ -1,14 +1,19 @@
 {
   "name": "expense-approval-workflow",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Serverless Intelligent Expense Approval Workflow -- TypeScript + Terraform + AWS",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc",
     "start": "tsx src/local/server.ts",
-    "test": "jest --verbose --forceExit",
+    "test": "jest --verbose --forceExit && cd frontend && npx vitest run",
     "test:unit": "jest tests/unit --verbose --forceExit",
     "test:integration": "jest tests/integration --verbose --forceExit",
+    "test:aws": "STORAGE_MODE=aws jest tests/integration/aws.test.ts --verbose --forceExit",
+    "test:chaos": "jest tests/chaos --verbose --forceExit",
     "clean": "rimraf dist dist.zip"
   },
   "keywords": [
@@ -28,7 +33,9 @@
     "express": "^4.21.0",
     "js-yaml": "^4.1.0",
     "swagger-ui-express": "^5.0.1",
-    "uuid": "^11.0.0"
+    "uuid": "^11.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "bcrypt": "^5.1.1"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.145",
@@ -39,6 +46,8 @@
     "@types/node": "^22.10.0",
     "@types/swagger-ui-express": "^4.1.7",
     "@types/uuid": "^10.0.0",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/bcrypt": "^5.0.2",
     "jest": "^29.7.0",
     "rimraf": "^6.0.0",
     "ts-jest": "^29.2.0",

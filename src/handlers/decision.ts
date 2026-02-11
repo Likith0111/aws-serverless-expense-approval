@@ -5,20 +5,29 @@
  * a final approval decision. Also persists the record to DynamoDB.
  *
  * Decision matrix:
- *   REJECTED             -- Validation failed or amount exceeds category limit.
- *   NEEDS_MANUAL_REVIEW  -- Non-critical policy violations, missing receipt,
- *                           or medium/high fraud risk.
- *   APPROVED             -- All checks passed with low fraud risk.
+ *   FAILED_PROCESSING       -- Workflow error (from Catch block compensation).
+ *   REJECTED                -- Validation failed or amount exceeds category limit.
+ *   NEEDS_MANUAL_REVIEW     -- Non-critical policy violations or medium/high fraud risk.
+ *   APPROVED                -- All checks passed with low fraud risk.
  *
- * Architectural note:
- *   The handler accepts both a single object (normal flow) and an array
- *   (output from Step Functions Parallel state). This dual-format support
- *   is required because PolicyCheck and FraudHeuristic run in parallel,
- *   producing an array output that must be merged before decision logic.
+ * Compensation logic:
+ *   When a Step Functions Catch block fires, it sets event.error with the
+ *   Error and Cause fields. This handler detects that condition and stores
+ *   a FAILED_PROCESSING record so the failure is visible to operators and
+ *   auditable in the expense table.
+ *
+ * Dead code note (hasReceiptViolation):
+ *   A previous version had a separate receipt-violation check after the
+ *   general policy/fraud review block. This was unreachable because receipt
+ *   violations set policyCheck.passed = false, which is already caught by
+ *   the general needsReview block. The dead code has been removed.
  */
 
-import { ExpenseEvent } from "../models/expense";
+import { ExpenseEvent, DecisionOutcome } from "../models/expense";
 import { storeExpenseDecision } from "../utils/dynamo";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("Decision");
 
 // ---------------------------------------------------------------------------
 // Lambda handler
@@ -31,13 +40,18 @@ export const handler = async (
   // Step Functions Parallel state outputs an array -- merge it first.
   let expense: ExpenseEvent;
   if (Array.isArray(event)) {
-    console.log("Merging parallel state outputs");
+    log.info("Merging parallel state outputs", { branchCount: event.length });
     expense = mergeParallelResults(event);
   } else {
     expense = event;
   }
 
-  console.log(`Making decision for expense: ${expense.expenseId ?? "unknown"}`);
+  log.info("Rendering decision", {
+    expenseId: expense.expenseId,
+    correlationId: expense.correlationId,
+    employeeId: expense.employeeId,
+    hasError: !!expense.error,
+  });
 
   const { outcome, reasons } = makeDecision(expense);
 
@@ -46,12 +60,19 @@ export const handler = async (
   expense.status = outcome;
   expense.updatedAt = decidedAt;
 
-  // Persist to DynamoDB. If storage fails we still return the decision.
   try {
     await storeExpenseDecision(expense);
-    console.log(`Decision stored: ${expense.expenseId} -> ${outcome}`);
+    log.info("Decision persisted", {
+      expenseId: expense.expenseId,
+      correlationId: expense.correlationId,
+      outcome,
+    });
   } catch (err) {
-    console.error(`Failed to store decision in DynamoDB: ${err}`);
+    log.error("Failed to persist decision to DynamoDB", {
+      expenseId: expense.expenseId,
+      correlationId: expense.correlationId,
+      error: String(err),
+    });
     expense.storageError = String(err);
   }
 
@@ -62,13 +83,6 @@ export const handler = async (
 // Parallel-state merger
 // ---------------------------------------------------------------------------
 
-/**
- * Merge results from a Step Functions Parallel state.
- *
- * The Parallel state emits an array where each element is the output
- * of one branch. We merge them into a single object so downstream
- * logic can access all check results uniformly.
- */
 export function mergeParallelResults(outputs: unknown[]): ExpenseEvent {
   const merged: Record<string, unknown> = {};
   for (const output of outputs) {
@@ -87,15 +101,23 @@ export function mergeParallelResults(outputs: unknown[]): ExpenseEvent {
  * Determine the final approval outcome.
  *
  * Decision priority (first match wins):
+ *   0. Workflow error (Catch block)  -> FAILED_PROCESSING
  *   1. Validation failure            -> REJECTED
  *   2. Amount exceeds category limit -> REJECTED
- *   3. Policy violations / fraud     -> NEEDS_MANUAL_REVIEW
+ *   3. Policy violations or fraud    -> NEEDS_MANUAL_REVIEW
  *   4. All clear                     -> APPROVED
  */
 export function makeDecision(
   expense: ExpenseEvent,
-): { outcome: "APPROVED" | "REJECTED" | "NEEDS_MANUAL_REVIEW"; reasons: string[] } {
+): { outcome: DecisionOutcome; reasons: string[] } {
   const reasons: string[] = [];
+
+  // --- Priority 0: Workflow error (compensation) ----------------------------
+  if (expense.error) {
+    reasons.push(`Workflow execution error: ${expense.error.Error}`);
+    reasons.push(expense.error.Cause || "Unknown cause");
+    return { outcome: "FAILED_PROCESSING", reasons };
+  }
 
   // Extract check results with safe defaults.
   const validation = expense.validation ?? { passed: false, errors: [] };
@@ -126,10 +148,6 @@ export function makeDecision(
   // --- Priority 3: Soft policy issues or elevated fraud -> review -----------
   let needsReview = false;
 
-  const hasReceiptViolation = policyCheck.violations.some((v) =>
-    v.toLowerCase().includes("receipt"),
-  );
-
   if (!policyCheck.passed) {
     needsReview = true;
     reasons.push("Policy violations require manual review");
@@ -142,11 +160,6 @@ export function makeDecision(
       `Fraud risk level: ${fraudCheck.riskLevel} (score: ${fraudCheck.riskScore})`,
     );
     reasons.push(...fraudCheck.riskFlags);
-  }
-
-  if (hasReceiptViolation && !needsReview) {
-    needsReview = true;
-    reasons.push("Missing receipt for expense over threshold");
   }
 
   if (needsReview) {

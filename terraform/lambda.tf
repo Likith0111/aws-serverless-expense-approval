@@ -1,19 +1,6 @@
 # =============================================================================
 # Lambda functions + deployment package
 # =============================================================================
-#
-# All Lambdas share a single deployment ZIP built from the compiled
-# TypeScript output in dist/. Each function specifies a different handler
-# entry point. The AWS SDK v3 is included in the Node.js 20.x runtime,
-# so the ZIP contains only application code.
-#
-# Build the package before deploying:
-#   npm run build
-#   cd terraform && terraform apply
-
-# ---------------------------------------------------------------------------
-# Deployment package
-# ---------------------------------------------------------------------------
 
 data "archive_file" "lambda_package" {
   type        = "zip"
@@ -22,13 +9,12 @@ data "archive_file" "lambda_package" {
 }
 
 # ---------------------------------------------------------------------------
-# Lambda functions
+# API Lambda (uses api_lambda_role -- can start workflows + read DynamoDB)
 # ---------------------------------------------------------------------------
 
-# API entry point -- receives HTTP requests and starts the workflow
 resource "aws_lambda_function" "submit_expense" {
   function_name    = "${var.project_name}-submit"
-  role             = aws_iam_role.lambda_role.arn
+  role             = aws_iam_role.api_lambda_role.arn
   handler          = "handlers/submitExpense.handler"
   runtime          = var.lambda_runtime
   memory_size      = var.lambda_memory
@@ -38,17 +24,24 @@ resource "aws_lambda_function" "submit_expense" {
 
   environment {
     variables = {
-      EXPENSES_TABLE    = aws_dynamodb_table.expenses.name
-      STATE_MACHINE_ARN = aws_sfn_state_machine.expense_workflow.arn
-      LOG_LEVEL         = "INFO"
+      EXPENSES_TABLE      = aws_dynamodb_table.expenses.name
+      STATE_MACHINE_ARN   = aws_sfn_state_machine.expense_workflow_v1.arn
+      WORKFLOW_VERSION    = "V1"
+      EMPLOYEE_INDEX_NAME = "EmployeeIndex"
+      LOG_LEVEL           = "INFO"
     }
   }
+
+  tags = { Name = "${var.project_name}-submit" }
 }
 
-# Workflow Step 1: Validate expense claim
+# ---------------------------------------------------------------------------
+# Workflow Lambdas (use workflow_lambda_role -- can write to DynamoDB)
+# ---------------------------------------------------------------------------
+
 resource "aws_lambda_function" "validate_expense" {
   function_name    = "${var.project_name}-validate"
-  role             = aws_iam_role.lambda_role.arn
+  role             = aws_iam_role.workflow_lambda_role.arn
   handler          = "handlers/validateExpense.handler"
   runtime          = var.lambda_runtime
   memory_size      = var.lambda_memory
@@ -57,16 +50,15 @@ resource "aws_lambda_function" "validate_expense" {
   source_code_hash = data.archive_file.lambda_package.output_base64sha256
 
   environment {
-    variables = {
-      LOG_LEVEL = "INFO"
-    }
+    variables = { LOG_LEVEL = "INFO" }
   }
+
+  tags = { Name = "${var.project_name}-validate" }
 }
 
-# Workflow Step 2a: Corporate policy check
 resource "aws_lambda_function" "policy_check" {
   function_name    = "${var.project_name}-policy-check"
-  role             = aws_iam_role.lambda_role.arn
+  role             = aws_iam_role.workflow_lambda_role.arn
   handler          = "handlers/policyCheck.handler"
   runtime          = var.lambda_runtime
   memory_size      = var.lambda_memory
@@ -75,16 +67,15 @@ resource "aws_lambda_function" "policy_check" {
   source_code_hash = data.archive_file.lambda_package.output_base64sha256
 
   environment {
-    variables = {
-      LOG_LEVEL = "INFO"
-    }
+    variables = { LOG_LEVEL = "INFO" }
   }
+
+  tags = { Name = "${var.project_name}-policy-check" }
 }
 
-# Workflow Step 2b: Rule-based fraud detection
 resource "aws_lambda_function" "fraud_heuristic" {
   function_name    = "${var.project_name}-fraud-check"
-  role             = aws_iam_role.lambda_role.arn
+  role             = aws_iam_role.workflow_lambda_role.arn
   handler          = "handlers/fraudHeuristic.handler"
   runtime          = var.lambda_runtime
   memory_size      = var.lambda_memory
@@ -94,15 +85,17 @@ resource "aws_lambda_function" "fraud_heuristic" {
 
   environment {
     variables = {
-      LOG_LEVEL = "INFO"
+      LOG_LEVEL     = "INFO"
+      CHAOS_ENABLED = "false"
     }
   }
+
+  tags = { Name = "${var.project_name}-fraud-check" }
 }
 
-# Workflow Step 3: Final decision and persistence
 resource "aws_lambda_function" "decision" {
   function_name    = "${var.project_name}-decision"
-  role             = aws_iam_role.lambda_role.arn
+  role             = aws_iam_role.workflow_lambda_role.arn
   handler          = "handlers/decision.handler"
   runtime          = var.lambda_runtime
   memory_size      = var.lambda_memory
@@ -116,33 +109,40 @@ resource "aws_lambda_function" "decision" {
       LOG_LEVEL      = "INFO"
     }
   }
+
+  tags = { Name = "${var.project_name}-decision" }
 }
 
 # ---------------------------------------------------------------------------
-# CloudWatch Log Groups (explicit creation with retention policy)
+# CloudWatch Log Groups
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_log_group" "submit" {
   name              = "/aws/lambda/${aws_lambda_function.submit_expense.function_name}"
   retention_in_days = var.log_retention_days
+  tags              = { Name = "${var.project_name}-submit-logs" }
 }
 
 resource "aws_cloudwatch_log_group" "validate" {
   name              = "/aws/lambda/${aws_lambda_function.validate_expense.function_name}"
   retention_in_days = var.log_retention_days
+  tags              = { Name = "${var.project_name}-validate-logs" }
 }
 
 resource "aws_cloudwatch_log_group" "policy_check" {
   name              = "/aws/lambda/${aws_lambda_function.policy_check.function_name}"
   retention_in_days = var.log_retention_days
+  tags              = { Name = "${var.project_name}-policy-check-logs" }
 }
 
 resource "aws_cloudwatch_log_group" "fraud_heuristic" {
   name              = "/aws/lambda/${aws_lambda_function.fraud_heuristic.function_name}"
   retention_in_days = var.log_retention_days
+  tags              = { Name = "${var.project_name}-fraud-check-logs" }
 }
 
 resource "aws_cloudwatch_log_group" "decision" {
   name              = "/aws/lambda/${aws_lambda_function.decision.function_name}"
   retention_in_days = var.log_retention_days
+  tags              = { Name = "${var.project_name}-decision-logs" }
 }

@@ -5,20 +5,16 @@ info:
   description: |
     Serverless Intelligent Expense Approval Workflow API.
 
-    This API processes employee expense claims through an automated approval
-    workflow that validates expenses, checks corporate policies, detects
-    potential fraud using rule-based heuristics, and makes approval decisions.
+    Processes employee expense claims through validation, policy checking,
+    fraud analysis, and automated decision-making. Supports workflow
+    versioning (V1/V2) and manual approval for flagged expenses.
 
-    Workflow Steps:
-      1. Validate expense claim structure and values
-      2. Check against corporate spending policies (parallel)
-      3. Apply fraud detection heuristics (parallel)
-      4. Make final approval decision (APPROVED, REJECTED, NEEDS_MANUAL_REVIEW)
-
-    Decisions are persisted to DynamoDB and retrievable via the GET endpoint.
-  version: 1.0.0
-  contact:
-    name: Expense Approval Team
+    Key features:
+      - Deterministic expense IDs for idempotent submissions
+      - Correlation IDs for distributed tracing
+      - Paginated employee expense queries via DynamoDB GSI
+      - Manual approval endpoint for NEEDS_MANUAL_REVIEW decisions (V2)
+  version: 2.0.0
 
 servers:
   - url: http://localhost:5050
@@ -34,16 +30,19 @@ servers:
 tags:
   - name: Expenses
     description: Expense claim submission and retrieval
+  - name: Review
+    description: Manual review endpoints
   - name: Health
     description: Service health check
+  - name: Development
+    description: Local development endpoints (not deployed to AWS)
 
 paths:
   /:
     get:
       summary: Health check
       operationId: healthCheck
-      tags:
-        - Health
+      tags: [Health]
       responses:
         "200":
           description: Service is healthy
@@ -54,13 +53,14 @@ paths:
                 properties:
                   service:
                     type: string
-                    example: "expense-approval-workflow"
                   status:
                     type: string
-                    example: "healthy"
                   mode:
                     type: string
-                    example: "local-development"
+                  workflowVersion:
+                    type: string
+                  chaosEnabled:
+                    type: boolean
                   timestamp:
                     type: string
                     format: date-time
@@ -69,13 +69,13 @@ paths:
     post:
       summary: Submit an expense claim
       description: |
-        Submit a new expense claim for automated processing. The claim flows
-        through validation, policy checking, fraud analysis, and decision
-        rendering. The response includes the generated expense ID and
-        current processing status.
+        Submit a new expense claim. The expense ID is generated
+        deterministically from the content fields, so resubmitting
+        the same expense returns 409 with the existing record
+        (idempotent). Each request gets a unique correlationId
+        for distributed tracing.
       operationId: submitExpense
-      tags:
-        - Expenses
+      tags: [Expenses]
       requestBody:
         required: true
         content:
@@ -83,110 +83,120 @@ paths:
             schema:
               $ref: "#/components/schemas/ExpenseClaimRequest"
             examples:
-              standard_meal:
-                summary: Standard meal expense (will be APPROVED)
+              approved:
+                summary: Standard meal (APPROVED)
                 value:
                   employeeId: "EMP-001"
                   amount: 45.00
                   category: "meals"
                   description: "Team lunch at downtown restaurant"
                   receiptProvided: true
-              travel_expense:
-                summary: Travel expense (will be APPROVED)
+              rejected:
+                summary: Over limit (REJECTED)
                 value:
                   employeeId: "EMP-002"
-                  amount: 350.00
-                  category: "travel"
-                  description: "Flight to NYC for client meeting"
+                  amount: 500.00
+                  category: "meals"
+                  description: "Executive dinner at luxury venue"
                   receiptProvided: true
-              suspicious_expense:
-                summary: Suspicious expense (will need MANUAL REVIEW)
+              review:
+                summary: Suspicious (NEEDS_MANUAL_REVIEW)
                 value:
                   employeeId: "EMP-003"
                   amount: 24.99
                   category: "miscellaneous"
                   description: "test expense"
                   receiptProvided: false
-              over_limit:
-                summary: Over-limit expense (will be REJECTED)
-                value:
-                  employeeId: "EMP-004"
-                  amount: 5000.00
-                  category: "meals"
-                  description: "Executive dinner at luxury venue"
-                  receiptProvided: true
       responses:
         "202":
-          description: Expense claim accepted and processing started
+          description: Expense accepted and processed
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ExpenseSubmissionResponse"
-              example:
-                message: "Expense claim submitted and processed successfully"
-                expenseId: "EXP-1A2B3C4D5E6F"
-                submittedAt: "2026-02-08T10:30:00+00:00"
-                status: "APPROVED"
+                $ref: "#/components/schemas/SubmissionResponse"
         "400":
-          description: Invalid request body
+          description: Invalid request
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error: "Missing required fields: category, description"
-        "422":
-          description: Validation error (Pydantic)
+        "409":
+          description: Duplicate submission (idempotent)
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                type: object
+                properties:
+                  message:
+                    type: string
+                  expenseId:
+                    type: string
+                  correlationId:
+                    type: string
+                  status:
+                    type: string
 
   /expense/{expenseId}:
     get:
-      summary: Get expense decision
-      description: |
-        Retrieve the full expense record including validation results,
-        policy check outcome, fraud analysis, and the final approval decision.
+      summary: Get expense by ID
       operationId: getExpense
-      tags:
-        - Expenses
+      tags: [Expenses]
       parameters:
         - name: expenseId
           in: path
           required: true
-          description: The unique expense identifier returned from submission
           schema:
             type: string
-            example: "EXP-1A2B3C4D5E6F"
       responses:
         "200":
-          description: Expense record found
+          description: Expense found
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ExpenseDecisionResponse"
+                $ref: "#/components/schemas/ExpenseRecord"
         "404":
-          description: Expense not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                detail: "Expense EXP-NOTFOUND not found"
-
-  /expenses:
-    get:
-      summary: List all expenses
-      description: |
-        List all processed expense claims. This endpoint is available
-        in the local development server only.
-      operationId: listExpenses
-      tags:
-        - Expenses
+          description: Not found
+    delete:
+      summary: Delete expense (local only)
+      operationId: deleteExpense
+      tags: [Development]
+      parameters:
+        - name: expenseId
+          in: path
+          required: true
+          schema:
+            type: string
       responses:
         "200":
-          description: List of all expense records
+          description: Deleted
+        "404":
+          description: Not found
+
+  /expenses/employee/{employeeId}:
+    get:
+      summary: Get expenses by employee (paginated)
+      description: |
+        Query all expenses for an employee using the DynamoDB
+        EmployeeIndex GSI. Results are paginated. Pass the
+        nextToken from the response as a query parameter to
+        retrieve the next page.
+      operationId: getExpensesByEmployee
+      tags: [Expenses]
+      parameters:
+        - name: employeeId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: nextToken
+          in: query
+          required: false
+          description: Pagination token from previous response
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated expense list
           content:
             application/json:
               schema:
@@ -195,79 +205,122 @@ paths:
                   expenses:
                     type: array
                     items:
-                      $ref: "#/components/schemas/ExpenseDecisionResponse"
+                      $ref: "#/components/schemas/ExpenseRecord"
                   count:
                     type: integer
-                    example: 3
+                  employeeId:
+                    type: string
+                  nextToken:
+                    type: string
+                    nullable: true
+
+  /expenses/{expenseId}/manual-decision:
+    post:
+      summary: Submit manual review decision (local only)
+      description: |
+        Approve or reject an expense that was flagged as
+        NEEDS_MANUAL_REVIEW. Only valid when the expense
+        is in NEEDS_MANUAL_REVIEW or PENDING_REVIEW status.
+      operationId: manualDecision
+      tags: [Review]
+      parameters:
+        - name: expenseId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManualDecisionRequest"
+            example:
+              decision: "APPROVED"
+              reason: "Verified with employee, expense is legitimate"
+              reviewedBy: "manager@company.com"
+      responses:
+        "200":
+          description: Decision applied
+        "400":
+          description: Invalid request or expense not reviewable
+        "404":
+          description: Expense not found
+
+  /expenses:
+    get:
+      summary: List all expenses (local only)
+      operationId: listExpenses
+      tags: [Development]
+      responses:
+        "200":
+          description: All expenses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  expenses:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ExpenseRecord"
+                  count:
+                    type: integer
 
 components:
   schemas:
     ExpenseClaimRequest:
       type: object
-      required:
-        - employeeId
-        - amount
-        - category
-        - description
-        - receiptProvided
+      required: [employeeId, amount, category, description, receiptProvided]
       properties:
         employeeId:
           type: string
-          description: Unique employee identifier
           example: "EMP-001"
         amount:
           type: number
-          format: double
           minimum: 0.01
-          description: Expense amount in USD
-          example: 250.00
+          example: 45.00
         category:
           type: string
-          enum:
-            - travel
-            - meals
-            - accommodation
-            - office_supplies
-            - software
-            - training
-            - client_entertainment
-            - transportation
-            - miscellaneous
-          description: Expense category
-          example: "travel"
+          enum: [travel, meals, accommodation, office_supplies, software, training, client_entertainment, transportation, miscellaneous]
         description:
           type: string
           minLength: 3
-          description: Description of the expense
-          example: "Flight to NYC for client meeting"
+          description: HTML tags are stripped automatically
         receiptProvided:
           type: boolean
-          description: Whether a receipt was provided
-          example: true
 
-    ExpenseSubmissionResponse:
+    SubmissionResponse:
       type: object
       properties:
         message:
           type: string
-          example: "Expense claim submitted and processed successfully"
         expenseId:
           type: string
-          example: "EXP-1A2B3C4D5E6F"
+        correlationId:
+          type: string
         submittedAt:
           type: string
           format: date-time
-          example: "2026-02-08T10:30:00+00:00"
         status:
           type: string
-          enum:
-            - PROCESSING
-            - APPROVED
-            - REJECTED
-            - NEEDS_MANUAL_REVIEW
-          example: "APPROVED"
+        workflowVersion:
+          type: string
 
-    ExpenseDecisionResponse:
+    ManualDecisionRequest:
+      type: object
+      required: [decision, reason]
+      properties:
+        decision:
+          type: string
+          enum: [APPROVED, REJECTED]
+        reason:
+          type: string
+          minLength: 3
+        reviewedBy:
+          type: string
+
+    ExpenseRecord:
       type: object
       properties:
         expenseId:
@@ -285,91 +338,16 @@ components:
         submittedAt:
           type: string
           format: date-time
-        validation:
-          $ref: "#/components/schemas/ValidationResult"
-        policyCheck:
-          $ref: "#/components/schemas/PolicyCheckResult"
-        fraudCheck:
-          $ref: "#/components/schemas/FraudCheckResult"
-        decision:
-          $ref: "#/components/schemas/DecisionResult"
+        correlationId:
+          type: string
+        workflowVersion:
+          type: string
         status:
           type: string
-          enum:
-            - APPROVED
-            - REJECTED
-            - NEEDS_MANUAL_REVIEW
-
-    ValidationResult:
-      type: object
-      properties:
-        passed:
-          type: boolean
-        errors:
-          type: array
-          items:
-            type: string
-        validatedAt:
-          type: string
-          format: date-time
-
-    PolicyCheckResult:
-      type: object
-      properties:
-        passed:
-          type: boolean
-        violations:
-          type: array
-          items:
-            type: string
-        checkedAt:
-          type: string
-          format: date-time
-
-    FraudCheckResult:
-      type: object
-      properties:
-        riskScore:
-          type: integer
-          minimum: 0
-          maximum: 100
-        riskLevel:
-          type: string
-          enum:
-            - LOW
-            - MEDIUM
-            - HIGH
-        riskFlags:
-          type: array
-          items:
-            type: string
-        analyzedAt:
-          type: string
-          format: date-time
-
-    DecisionResult:
-      type: object
-      properties:
-        outcome:
-          type: string
-          enum:
-            - APPROVED
-            - REJECTED
-            - NEEDS_MANUAL_REVIEW
-        reasons:
-          type: array
-          items:
-            type: string
-        decidedAt:
-          type: string
-          format: date-time
+          enum: [PROCESSING, APPROVED, REJECTED, NEEDS_MANUAL_REVIEW, PENDING_REVIEW, FAILED_PROCESSING]
 
     ErrorResponse:
       type: object
       properties:
         error:
           type: string
-          example: "Missing required fields: category"
-        detail:
-          type: string
-          example: "Additional error details"

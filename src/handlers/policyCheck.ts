@@ -17,6 +17,9 @@
  */
 
 import { ExpenseEvent } from "../models/expense";
+import { createLogger } from "../utils/logger";
+
+const log = createLogger("PolicyCheck");
 
 // ---------------------------------------------------------------------------
 // Policy configuration
@@ -53,7 +56,12 @@ export const handler = async (
   event: ExpenseEvent,
   _context: unknown,
 ): Promise<ExpenseEvent> => {
-  console.log(`Running policy check for expense: ${event.expenseId ?? "unknown"}`);
+  log.info("Starting policy check", {
+    expenseId: event.expenseId,
+    correlationId: event.correlationId,
+    amount: event.amount,
+    category: event.category,
+  });
 
   const violations = checkPolicy(event);
 
@@ -63,11 +71,19 @@ export const handler = async (
     checkedAt: new Date().toISOString(),
   };
 
-  console.log(
-    `Policy check ${
-      violations.length === 0 ? "passed" : `found ${violations.length} violation(s)`
-    } for ${event.expenseId}`,
-  );
+  if (violations.length > 0) {
+    log.warn("Policy violations found", {
+      expenseId: event.expenseId,
+      correlationId: event.correlationId,
+      violationCount: violations.length,
+      violations,
+    });
+  } else {
+    log.info("Policy check passed", {
+      expenseId: event.expenseId,
+      correlationId: event.correlationId,
+    });
+  }
 
   return event;
 };
@@ -82,7 +98,6 @@ export function checkPolicy(
   const violations: string[] = [];
   const { amount, category, receiptProvided } = expense;
 
-  // --- Category spending limit ----------------------------------------------
   const limit = CATEGORY_LIMITS[category];
   if (limit !== undefined && amount > limit) {
     violations.push(
@@ -90,14 +105,12 @@ export function checkPolicy(
     );
   }
 
-  // --- Receipt requirement --------------------------------------------------
   if (amount > RECEIPT_REQUIRED_THRESHOLD && !receiptProvided) {
     violations.push(
       `Receipt required for expenses over $${RECEIPT_REQUIRED_THRESHOLD.toFixed(2)}`,
     );
   }
 
-  // --- High-scrutiny category review ----------------------------------------
   const scrutinyThreshold = HIGH_SCRUTINY_CATEGORIES[category];
   if (scrutinyThreshold !== undefined && amount > scrutinyThreshold) {
     violations.push(
